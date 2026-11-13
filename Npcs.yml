@@ -1,0 +1,772 @@
+name: Build Npcs
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Create project
+        run: |
+          mkdir -p proj/src/main/java/ru/eclips/npcs proj/src/main/resources
+
+          cat > proj/pom.xml <<'EOF_POM'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <project xmlns="http://maven.apache.org/POM/4.0.0"
+                   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+            <modelVersion>4.0.0</modelVersion>
+            <groupId>ru.eclips</groupId>
+            <artifactId>Npcs</artifactId>
+            <version>1.0.0</version>
+            <packaging>jar</packaging>
+
+            <properties>
+              <maven.compiler.source>17</maven.compiler.source>
+              <maven.compiler.target>17</maven.compiler.target>
+              <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+            </properties>
+
+            <repositories>
+              <repository>
+                <id>lanink</id>
+                <url>https://repo.lanink.cn/repository/maven-public/</url>
+              </repository>
+              <repository>
+                <id>opencollab</id>
+                <url>https://repo.opencollab.dev/maven-snapshots/</url>
+              </repository>
+            </repositories>
+
+            <dependencies>
+              <dependency>
+                <groupId>cn.nukkit</groupId>
+                <artifactId>Nukkit</artifactId>
+                <version>MOT-SNAPSHOT</version>
+                <scope>provided</scope>
+              </dependency>
+              <dependency>
+                <groupId>com.google.code.gson</groupId>
+                <artifactId>gson</artifactId>
+                <version>2.10.1</version>
+                <scope>provided</scope>
+              </dependency>
+            </dependencies>
+
+            <build>
+              <finalName>Npcs</finalName>
+              <plugins>
+                <plugin>
+                  <groupId>org.apache.maven.plugins</groupId>
+                  <artifactId>maven-compiler-plugin</artifactId>
+                  <version>3.11.0</version>
+                  <configuration>
+                    <release>17</release>
+                    <encoding>UTF-8</encoding>
+                  </configuration>
+                </plugin>
+              </plugins>
+            </build>
+          </project>
+          EOF_POM
+
+          cat > proj/src/main/resources/plugin.yml <<'EOF_YML'
+          name: Npcs
+          main: ru.eclips.npcs.NpcsPlugin
+          version: "1.0.0"
+          api: ["1.0.0"]
+          author: Eclips
+          description: Player-like NPCs with click commands and help menu
+          commands:
+            "npc+":
+              description: "Create NPC slot in the list"
+              usage: "/npc+ <1-50>"
+              permission: npcs.admin
+              aliases: [npcadd]
+            "npc-":
+              description: "Remove NPC from the list"
+              usage: "/npc- <id>"
+              permission: npcs.admin
+              aliases: [npcremove]
+            npclist:
+              description: "List of NPCs"
+              usage: "/npclist"
+              permission: npcs.admin
+            npctp:
+              description: "Teleport to NPC"
+              usage: "/npctp <id>"
+              permission: npcs.admin
+            npccmd:
+              description: "Set command executed on NPC click"
+              usage: "/npccmd <id> <command>"
+              permission: npcs.admin
+            npcspawn:
+              description: "Spawn NPC in front of you"
+              usage: "/npcspawn <id> <name>"
+              permission: npcs.admin
+            npsdell:
+              description: "Remove NPC from the server by name"
+              usage: "/npsdell <name>"
+              permission: npcs.admin
+              aliases: [npcdel]
+            npshick:
+              description: "Set NPC nickname"
+              usage: "/npshick <id> <nick>"
+              permission: npcs.admin
+              aliases: [npcnick]
+            help:
+              description: "Server help menu"
+              usage: "/help"
+              permission: npcs.help
+          permissions:
+            npcs.admin:
+              description: "Manage NPCs"
+              default: op
+            npcs.help:
+              description: "Open help menu"
+              default: true
+          EOF_YML
+
+          cat > proj/src/main/java/ru/eclips/npcs/NpcEntity.java <<'EOF_NPCENTITY'
+          package ru.eclips.npcs;
+
+          import cn.nukkit.entity.EntityHuman;
+          import cn.nukkit.level.format.FullChunk;
+          import cn.nukkit.nbt.tag.CompoundTag;
+
+          public class NpcEntity extends EntityHuman {
+
+              public int npcId;
+
+              public NpcEntity(FullChunk chunk, CompoundTag nbt) {
+                  super(chunk, nbt);
+              }
+          }
+          EOF_NPCENTITY
+
+          cat > proj/src/main/java/ru/eclips/npcs/NpcsPlugin.java <<'EOF_PLUGIN'
+          package ru.eclips.npcs;
+
+          import cn.nukkit.Player;
+          import cn.nukkit.command.Command;
+          import cn.nukkit.command.CommandSender;
+          import cn.nukkit.entity.Entity;
+          import cn.nukkit.event.EventHandler;
+          import cn.nukkit.event.Listener;
+          import cn.nukkit.event.entity.EntityDamageByEntityEvent;
+          import cn.nukkit.event.entity.EntityDamageEvent;
+          import cn.nukkit.event.player.PlayerInteractEntityEvent;
+          import cn.nukkit.form.element.ElementButton;
+          import cn.nukkit.form.window.FormWindowSimple;
+          import cn.nukkit.level.Level;
+          import cn.nukkit.level.Location;
+          import cn.nukkit.level.format.FullChunk;
+          import cn.nukkit.nbt.tag.CompoundTag;
+          import cn.nukkit.nbt.tag.DoubleTag;
+          import cn.nukkit.nbt.tag.FloatTag;
+          import cn.nukkit.nbt.tag.ListTag;
+          import cn.nukkit.plugin.PluginBase;
+          import cn.nukkit.scheduler.Task;
+          import cn.nukkit.utils.TextFormat;
+          import com.google.gson.Gson;
+          import com.google.gson.GsonBuilder;
+          import com.google.gson.reflect.TypeToken;
+
+          import javax.imageio.ImageIO;
+          import java.awt.image.BufferedImage;
+          import java.io.File;
+          import java.lang.reflect.Type;
+          import java.nio.charset.StandardCharsets;
+          import java.nio.file.Files;
+          import java.util.ArrayList;
+          import java.util.HashMap;
+          import java.util.List;
+          import java.util.Map;
+          import java.util.TreeMap;
+
+          public class NpcsPlugin extends PluginBase implements Listener {
+
+              private static final int MAX_ID = 50;
+
+              private static final String HELP_TEXT =
+                      "§l§6Как получить привилегию?§r\n"
+                      + "Сними ролик о нашем сервере и скинь в Telegram: §b@Mysticwinds21§r\n"
+                      + "Наш Telegram: §b@Eclipsdev§r\n\n"
+                      + "§l§6Как создать регион?§r\n"
+                      + "Для этого нужно установить золотой блок. Дополнительная информация: §e/rg§r\n"
+                      + "§cВажно: приват не защищает от взрывов§r\n\n"
+                      + "§l§6Команды:§r\n"
+                      + "§e/shop§r - открыть магазин\n"
+                      + "§e/duel§r - дуэли\n"
+                      + "§e/report§r - написать жалобу на игрока\n"
+                      + "§e/sethome <название>§r - установить точку дома\n"
+                      + "§e/home <название>§r - телепортироваться в точку дома\n"
+                      + "§e/auc§r - открыть аукцион\n\n"
+                      + "Сервер создаётся одним человеком, будем рады вашей поддержке! "
+                      + "Если нашли баг, хотите подать заявку на привилегию или у вас есть идеи "
+                      + "для улучшения сервера - пишите в Telegram: §b@Mysticwinds21";
+
+              public static class Npc {
+                  public int id;
+                  public String name;
+                  public String cmd;
+                  public String world;
+                  public double x;
+                  public double y;
+                  public double z;
+                  public double yaw;
+                  public double pitch;
+                  public boolean spawned;
+                  public transient NpcEntity entity;
+                  public transient int fails;
+              }
+
+              private final Map<Integer, Npc> npcs = new TreeMap<>();
+              private final Map<String, Long> clickTime = new HashMap<>();
+              private final Gson gson = new GsonBuilder().setPrettyPrinting().create();
+              private File dataFile;
+              private File skinsDir;
+
+              @Override
+              public void onEnable() {
+                  getDataFolder().mkdirs();
+                  skinsDir = new File(getDataFolder(), "skins");
+                  skinsDir.mkdirs();
+                  dataFile = new File(getDataFolder(), "npcs.json");
+                  load();
+                  getServer().getPluginManager().registerEvents(this, this);
+                  getServer().getScheduler().scheduleRepeatingTask(this, new Task() {
+                      @Override
+                      public void onRun(int currentTick) {
+                          respawnTick();
+                      }
+                  }, 40);
+                  getLogger().info("Npcs enabled, NPC in list: " + npcs.size());
+              }
+
+              @Override
+              public void onDisable() {
+                  for (Npc n : npcs.values()) {
+                      removeEntity(n);
+                  }
+              }
+
+              // ---------- storage ----------
+
+              private void load() {
+                  npcs.clear();
+                  if (dataFile.exists()) {
+                      try {
+                          String json = new String(Files.readAllBytes(dataFile.toPath()), StandardCharsets.UTF_8);
+                          Type t = new TypeToken<List<Npc>>() {}.getType();
+                          List<Npc> list = gson.fromJson(json, t);
+                          if (list != null) {
+                              for (Npc n : list) {
+                                  npcs.put(n.id, n);
+                              }
+                          }
+                      } catch (Exception e) {
+                          getLogger().error("npcs.json read error: " + e.getMessage());
+                      }
+                      return;
+                  }
+                  Npc a = new Npc();
+                  a.id = 1;
+                  a.name = "Торговец";
+                  a.cmd = "shop";
+                  npcs.put(1, a);
+                  Npc b = new Npc();
+                  b.id = 2;
+                  b.name = "Помощь";
+                  b.cmd = "help";
+                  npcs.put(2, b);
+                  save();
+              }
+
+              private void save() {
+                  try {
+                      String json = gson.toJson(new ArrayList<Npc>(npcs.values()));
+                      Files.write(dataFile.toPath(), json.getBytes(StandardCharsets.UTF_8));
+                  } catch (Exception e) {
+                      getLogger().error("npcs.json write error: " + e.getMessage());
+                  }
+              }
+
+              // ---------- entities ----------
+
+              private void respawnTick() {
+                  for (Npc n : npcs.values()) {
+                      if (!n.spawned || n.fails >= 3 || n.world == null) {
+                          continue;
+                      }
+                      if (n.entity != null && !n.entity.closed) {
+                          continue;
+                      }
+                      Level lv = getServer().getLevelByName(n.world);
+                      if (lv == null) {
+                          continue;
+                      }
+                      int cx = ((int) Math.floor(n.x)) >> 4;
+                      int cz = ((int) Math.floor(n.z)) >> 4;
+                      if (!lv.isChunkLoaded(cx, cz)) {
+                          continue;
+                      }
+                      spawnEntity(n);
+                  }
+              }
+
+              private void removeEntity(Npc n) {
+                  if (n.entity != null) {
+                      try {
+                          if (!n.entity.closed) {
+                              n.entity.close();
+                          }
+                      } catch (Exception ignored) {
+                      }
+                      n.entity = null;
+                  }
+              }
+
+              private void spawnEntity(Npc n) {
+                  removeEntity(n);
+                  try {
+                      Level lv = getServer().getLevelByName(n.world);
+                      if (lv == null) {
+                          return;
+                      }
+                      int cx = ((int) Math.floor(n.x)) >> 4;
+                      int cz = ((int) Math.floor(n.z)) >> 4;
+                      FullChunk chunk = lv.getChunk(cx, cz, true);
+                      if (chunk == null) {
+                          return;
+                      }
+                      String nick = (n.name == null || n.name.isEmpty()) ? ("NPC " + n.id) : n.name;
+
+                      CompoundTag skin = new CompoundTag()
+                              .putByteArray("Data", buildSkin(n.id))
+                              .putInt("SkinImageWidth", 64)
+                              .putInt("SkinImageHeight", 64)
+                              .putString("ModelId", "eclips_npc_" + n.id);
+
+                      CompoundTag nbt = new CompoundTag()
+                              .putList(new ListTag<DoubleTag>("Pos")
+                                      .add(new DoubleTag("", n.x))
+                                      .add(new DoubleTag("", n.y))
+                                      .add(new DoubleTag("", n.z)))
+                              .putList(new ListTag<DoubleTag>("Motion")
+                                      .add(new DoubleTag("", 0))
+                                      .add(new DoubleTag("", 0))
+                                      .add(new DoubleTag("", 0)))
+                              .putList(new ListTag<FloatTag>("Rotation")
+                                      .add(new FloatTag("", (float) n.yaw))
+                                      .add(new FloatTag("", (float) n.pitch)))
+                              .putCompound("Skin", skin)
+                              .putString("NameTag", nick);
+
+                      NpcEntity e = new NpcEntity(chunk, nbt);
+                      e.npcId = n.id;
+                      e.setNameTag(nick);
+                      e.setNameTagVisible(true);
+                      e.setNameTagAlwaysVisible(true);
+                      e.spawnToAll();
+                      n.entity = e;
+                      n.fails = 0;
+                  } catch (Throwable t) {
+                      n.fails++;
+                      getLogger().error("NPC " + n.id + " spawn error: " + t);
+                  }
+              }
+
+              // ---------- skins ----------
+
+              private byte[] buildSkin(int id) {
+                  File f = new File(skinsDir, id + ".png");
+                  if (!f.exists()) {
+                      f = new File(skinsDir, "default.png");
+                  }
+                  if (f.exists()) {
+                      try {
+                          BufferedImage img = ImageIO.read(f);
+                          if (img != null && img.getWidth() == 64 && (img.getHeight() == 64 || img.getHeight() == 32)) {
+                              byte[] d = new byte[64 * 64 * 4];
+                              for (int y = 0; y < img.getHeight(); y++) {
+                                  for (int x = 0; x < 64; x++) {
+                                      int argb = img.getRGB(x, y);
+                                      int i = (y * 64 + x) * 4;
+                                      d[i] = (byte) ((argb >> 16) & 0xFF);
+                                      d[i + 1] = (byte) ((argb >> 8) & 0xFF);
+                                      d[i + 2] = (byte) (argb & 0xFF);
+                                      d[i + 3] = (byte) ((argb >>> 24) & 0xFF);
+                                  }
+                              }
+                              return d;
+                          }
+                          getLogger().warning("Skin " + f.getName() + " must be 64x64 (or 64x32) PNG, using generated skin");
+                      } catch (Exception ex) {
+                          getLogger().warning("Skin " + f.getName() + " read error: " + ex.getMessage());
+                      }
+                  }
+                  return generatedSkin(id);
+              }
+
+              private static void rect(byte[] d, int x0, int y0, int x1, int y1, int rgb) {
+                  for (int y = y0; y < y1; y++) {
+                      for (int x = x0; x < x1; x++) {
+                          int i = (y * 64 + x) * 4;
+                          d[i] = (byte) ((rgb >> 16) & 0xFF);
+                          d[i + 1] = (byte) ((rgb >> 8) & 0xFF);
+                          d[i + 2] = (byte) (rgb & 0xFF);
+                          d[i + 3] = (byte) 0xFF;
+                      }
+                  }
+              }
+
+              private static byte[] generatedSkin(int id) {
+                  int[] shirts = {0x3C8DBC, 0xC0392B, 0x27AE60, 0x8E44AD, 0xD68910, 0x16A085, 0x7F8C8D};
+                  int shirt = shirts[Math.abs(id - 1) % shirts.length];
+                  int tone = 0xE0AC84;
+                  int hair = 0x3B2A1A;
+                  int pants = 0x2C3E66;
+                  int shoes = 0x444444;
+                  byte[] d = new byte[64 * 64 * 4];
+                  rect(d, 0, 0, 32, 16, tone);
+                  rect(d, 8, 0, 24, 8, hair);
+                  rect(d, 24, 8, 32, 16, hair);
+                  rect(d, 0, 8, 32, 11, hair);
+                  rect(d, 9, 12, 10, 13, 0xFFFFFF);
+                  rect(d, 10, 12, 11, 13, 0x3A4FA0);
+                  rect(d, 13, 12, 14, 13, 0x3A4FA0);
+                  rect(d, 14, 12, 15, 13, 0xFFFFFF);
+                  rect(d, 11, 14, 13, 15, 0x8B4A3A);
+                  rect(d, 16, 16, 40, 32, shirt);
+                  rect(d, 40, 16, 56, 26, shirt);
+                  rect(d, 40, 26, 56, 32, tone);
+                  rect(d, 0, 16, 16, 32, pants);
+                  rect(d, 0, 29, 16, 32, shoes);
+                  rect(d, 16, 48, 32, 64, pants);
+                  rect(d, 16, 61, 32, 64, shoes);
+                  rect(d, 32, 48, 48, 58, shirt);
+                  rect(d, 32, 58, 48, 64, tone);
+                  return d;
+              }
+
+              // ---------- click handling ----------
+
+              @EventHandler
+              public void onDamage(EntityDamageEvent e) {
+                  if (!(e.getEntity() instanceof NpcEntity)) {
+                      return;
+                  }
+                  e.setCancelled(true);
+                  if (e instanceof EntityDamageByEntityEvent) {
+                      Entity damager = ((EntityDamageByEntityEvent) e).getDamager();
+                      if (damager instanceof Player) {
+                          click((Player) damager, (NpcEntity) e.getEntity());
+                      }
+                  }
+              }
+
+              @EventHandler
+              public void onInteract(PlayerInteractEntityEvent e) {
+                  if (e.getEntity() instanceof NpcEntity) {
+                      e.setCancelled(true);
+                      click(e.getPlayer(), (NpcEntity) e.getEntity());
+                  }
+              }
+
+              private void click(Player p, NpcEntity ent) {
+                  long now = System.currentTimeMillis();
+                  Long last = clickTime.get(p.getName());
+                  if (last != null && now - last < 600) {
+                      return;
+                  }
+                  clickTime.put(p.getName(), now);
+                  Npc n = npcs.get(ent.npcId);
+                  if (n == null || n.cmd == null || n.cmd.isEmpty()) {
+                      return;
+                  }
+                  getServer().dispatchCommand(p, n.cmd.replace("%p", p.getName()));
+              }
+
+              // ---------- help form ----------
+
+              private void showHelp(Player p) {
+                  FormWindowSimple form = new FormWindowSimple("§l§6Помощь", HELP_TEXT);
+                  form.addButton(new ElementButton("Закрыть"));
+                  p.showFormWindow(form);
+              }
+
+              // ---------- commands ----------
+
+              private Integer parseId(String s) {
+                  try {
+                      int v = Integer.parseInt(s.trim());
+                      if (v >= 1 && v <= MAX_ID) {
+                          return v;
+                      }
+                  } catch (Exception ignored) {
+                  }
+                  return null;
+              }
+
+              private String joinRaw(String[] a, int from) {
+                  StringBuilder sb = new StringBuilder();
+                  for (int i = from; i < a.length; i++) {
+                      if (i > from) {
+                          sb.append(' ');
+                      }
+                      sb.append(a[i]);
+                  }
+                  return sb.toString().trim();
+              }
+
+              private String joinName(String[] a, int from) {
+                  String s = joinRaw(a, from);
+                  if (s.length() >= 2 && s.startsWith("\"") && s.endsWith("\"")) {
+                      s = s.substring(1, s.length() - 1);
+                  }
+                  return s.replace('&', '§');
+              }
+
+              @Override
+              public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
+                  String c = command.getName().toLowerCase();
+                  switch (c) {
+                      case "help":
+                          if (sender instanceof Player) {
+                              showHelp((Player) sender);
+                          } else {
+                              sender.sendMessage(TextFormat.clean(HELP_TEXT));
+                          }
+                          return true;
+                      case "npc+":
+                          return cmdAdd(sender, args);
+                      case "npc-":
+                          return cmdRemove(sender, args);
+                      case "npclist":
+                          return cmdList(sender);
+                      case "npctp":
+                          return cmdTp(sender, args);
+                      case "npccmd":
+                          return cmdCmd(sender, args);
+                      case "npcspawn":
+                          return cmdSpawn(sender, args);
+                      case "npsdell":
+                          return cmdDell(sender, args);
+                      case "npshick":
+                          return cmdNick(sender, args);
+                      default:
+                          return false;
+                  }
+              }
+
+              private boolean cmdAdd(CommandSender s, String[] a) {
+                  Integer id = a.length > 0 ? parseId(a[0]) : null;
+                  if (id == null) {
+                      s.sendMessage("§cИспользование: /npc+ <1-" + MAX_ID + ">");
+                      return true;
+                  }
+                  if (npcs.containsKey(id)) {
+                      s.sendMessage("§cNPC с ID " + id + " уже есть в списке");
+                      return true;
+                  }
+                  Npc n = new Npc();
+                  n.id = id;
+                  npcs.put(id, n);
+                  save();
+                  s.sendMessage("§aNPC " + id + " создан в списке. Дальше: §e/npccmd " + id
+                          + " <команда>§a и §e/npcspawn " + id + " <название>");
+                  return true;
+              }
+
+              private boolean cmdRemove(CommandSender s, String[] a) {
+                  Integer id = a.length > 0 ? parseId(a[0]) : null;
+                  if (id == null) {
+                      s.sendMessage("§cИспользование: /npc- <id>");
+                      return true;
+                  }
+                  Npc n = npcs.get(id);
+                  if (n == null) {
+                      s.sendMessage("§cNPC с ID " + id + " нет в списке");
+                      return true;
+                  }
+                  removeEntity(n);
+                  npcs.remove(id);
+                  save();
+                  s.sendMessage("§aNPC " + id + " удалён из списка");
+                  return true;
+              }
+
+              private boolean cmdList(CommandSender s) {
+                  if (npcs.isEmpty()) {
+                      s.sendMessage("§eСписок NPC пуст");
+                      return true;
+                  }
+                  s.sendMessage("§6NPC в списке (" + npcs.size() + "):");
+                  for (Npc n : npcs.values()) {
+                      String nm = (n.name == null || n.name.isEmpty()) ? "§7без названия" : n.name;
+                      String cm = (n.cmd == null || n.cmd.isEmpty()) ? "§7нет" : "§f/" + n.cmd;
+                      String st = n.spawned ? "§aв мире" : "§cне заспавнен";
+                      s.sendMessage("§e" + n.id + " §7| §f" + nm + "§r §7| команда: " + cm + " §7| " + st);
+                  }
+                  return true;
+              }
+
+              private boolean cmdTp(CommandSender s, String[] a) {
+                  if (!(s instanceof Player)) {
+                      s.sendMessage("§cКоманда только для игрока");
+                      return true;
+                  }
+                  Player p = (Player) s;
+                  Integer id = a.length > 0 ? parseId(a[0]) : null;
+                  if (id == null) {
+                      s.sendMessage("§cИспользование: /npctp <id>");
+                      return true;
+                  }
+                  Npc n = npcs.get(id);
+                  if (n == null) {
+                      s.sendMessage("§cNPC с ID " + id + " нет в списке");
+                      return true;
+                  }
+                  Level lv = (n.spawned && n.world != null) ? getServer().getLevelByName(n.world) : null;
+                  if (lv == null) {
+                      s.sendMessage("§cNPC " + id + " не заспавнен");
+                      return true;
+                  }
+                  double r = Math.toRadians(n.yaw);
+                  double tx = n.x - Math.sin(r) * 1.5;
+                  double tz = n.z + Math.cos(r) * 1.5;
+                  p.teleport(new Location(tx, n.y, tz, (n.yaw + 180) % 360, 0, lv));
+                  s.sendMessage("§aВы телепортированы к NPC " + id);
+                  return true;
+              }
+
+              private boolean cmdCmd(CommandSender s, String[] a) {
+                  Integer id = a.length > 0 ? parseId(a[0]) : null;
+                  if (id == null) {
+                      s.sendMessage("§cИспользование: /npccmd <id> <команда без /> (\"-\" чтобы очистить)");
+                      return true;
+                  }
+                  Npc n = npcs.get(id);
+                  if (n == null) {
+                      s.sendMessage("§cNPC с ID " + id + " нет в списке");
+                      return true;
+                  }
+                  if (a.length == 1) {
+                      s.sendMessage("§eКоманда NPC " + id + ": " + ((n.cmd == null || n.cmd.isEmpty()) ? "нет" : "/" + n.cmd));
+                      return true;
+                  }
+                  String cmd = joinRaw(a, 1);
+                  while (cmd.startsWith("/")) {
+                      cmd = cmd.substring(1);
+                  }
+                  if (cmd.equals("-") || cmd.isEmpty()) {
+                      n.cmd = null;
+                      save();
+                      s.sendMessage("§aКоманда NPC " + id + " очищена");
+                      return true;
+                  }
+                  n.cmd = cmd;
+                  save();
+                  s.sendMessage("§aNPC " + id + " теперь выполняет: §f/" + cmd);
+                  return true;
+              }
+
+              private boolean cmdSpawn(CommandSender s, String[] a) {
+                  if (!(s instanceof Player)) {
+                      s.sendMessage("§cКоманда только для игрока");
+                      return true;
+                  }
+                  Player p = (Player) s;
+                  Integer id = a.length > 0 ? parseId(a[0]) : null;
+                  if (id == null) {
+                      s.sendMessage("§cИспользование: /npcspawn <id> <название>");
+                      return true;
+                  }
+                  Npc n = npcs.get(id);
+                  if (n == null) {
+                      s.sendMessage("§cNPC с ID " + id + " нет в списке. Сначала: §e/npc+ " + id);
+                      return true;
+                  }
+                  String nm = a.length > 1 ? joinName(a, 1) : n.name;
+                  if (nm == null || nm.isEmpty()) {
+                      s.sendMessage("§cУкажи название: /npcspawn " + id + " <название>");
+                      return true;
+                  }
+                  n.name = nm;
+                  double yawRad = Math.toRadians(p.getYaw());
+                  n.x = p.getX() - Math.sin(yawRad);
+                  n.y = p.getY();
+                  n.z = p.getZ() + Math.cos(yawRad);
+                  n.yaw = (p.getYaw() + 180) % 360;
+                  n.pitch = 0;
+                  n.world = p.getLevel().getFolderName();
+                  n.spawned = true;
+                  n.fails = 0;
+                  spawnEntity(n);
+                  save();
+                  s.sendMessage("§aNPC " + id + " (" + nm + "§r§a) заспавнен перед вами");
+                  return true;
+              }
+
+              private boolean cmdDell(CommandSender s, String[] a) {
+                  if (a.length < 1) {
+                      s.sendMessage("§cИспользование: /npsdell <название>");
+                      return true;
+                  }
+                  String q = TextFormat.clean(joinName(a, 0));
+                  Npc found = null;
+                  for (Npc n : npcs.values()) {
+                      if (n.name != null && TextFormat.clean(n.name).equalsIgnoreCase(q)) {
+                          found = n;
+                          break;
+                      }
+                  }
+                  if (found == null) {
+                      s.sendMessage("§cNPC с названием \"" + q + "\" не найден. Смотри /npclist");
+                      return true;
+                  }
+                  removeEntity(found);
+                  found.spawned = false;
+                  save();
+                  s.sendMessage("§aNPC " + found.id + " убран с сервера (в списке остался, можно снова /npcspawn)");
+                  return true;
+              }
+
+              private boolean cmdNick(CommandSender s, String[] a) {
+                  Integer id = a.length > 0 ? parseId(a[0]) : null;
+                  if (id == null || a.length < 2) {
+                      s.sendMessage("§cИспользование: /npshick <id> <ник>");
+                      return true;
+                  }
+                  Npc n = npcs.get(id);
+                  if (n == null) {
+                      s.sendMessage("§cNPC с ID " + id + " нет в списке");
+                      return true;
+                  }
+                  n.name = joinName(a, 1);
+                  save();
+                  if (n.spawned) {
+                      n.fails = 0;
+                      spawnEntity(n);
+                  }
+                  s.sendMessage("§aНик NPC " + id + ": " + n.name);
+                  return true;
+              }
+          }
+          EOF_PLUGIN
+
+      - name: Build
+        run: mvn -B -f proj/pom.xml package
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Npcs
+          path: proj/target/Npcs.jar
